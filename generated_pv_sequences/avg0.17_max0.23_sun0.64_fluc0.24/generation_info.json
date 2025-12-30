@@ -1,0 +1,32 @@
+{
+  "x_target_real": [
+    [
+      0.048,
+      0.185,
+      9.0,
+      0.4
+    ]
+  ],
+  "x_target_normalized": [
+    [
+      0.16552763917871396,
+      0.2258890298675213,
+      0.6428571428571429,
+      0.23906373451952204
+    ]
+  ],
+  "pattern_features_max": [
+    0.2899817833333333,
+    0.818986208,
+    14.0,
+    1.673193974
+  ],
+  "features": [
+    "average_power(kW)",
+    "max_power(kW)",
+    "sunshine_duration(hours)",
+    "fluctuation_power(kW)"
+  ],
+  "num_samples": 10,
+  "normalization_max": 0.818986208
+}

@@ -1,0 +1,17 @@
+{
+  "seq_len": 24,
+  "latent_dim": 64,
+  "pattern_embed_dim": 512,
+  "diffusion_T": 100,
+  "training_epochs": 800,
+  "batch_size": 10,
+  "learning_rate": 0.001,
+  "normalization_max": 0.818986208,
+  "pattern_features_max": [
+    0.2899817833333333,
+    0.818986208,
+    14.0,
+    1.673193974
+  ],
+  "num_samples": 1825
+}
