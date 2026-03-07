@@ -1,0 +1,42 @@
+{
+  "dataset_type": "PVDataSet",
+  "x_target_original": [
+    [
+      0.1323,
+      0.551,
+      89.0,
+      0.694,
+      0.217,
+      0.0368,
+      0.0019
+    ]
+  ],
+  "x_target_normalized": [
+    [
+      0.13230000436306,
+      0.5509999990463257,
+      89.0,
+      0.6940000057220459,
+      0.21699999272823334,
+      0.03680000081658363,
+      0.0019000000320374966
+    ]
+  ],
+  "pattern_features_max": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "normalization_max": 0.9,
+  "num_samples": 10,
+  "features": [
+    "average_power(kW)",
+    "max_power(kW)",
+    "sunshine_duration(hours)",
+    "fluctuation_power(kW)"
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "x_target_real": [
+    [
+      0.5,
+      0.9,
+      0.3,
+      1.8
+    ]
+  ],
+  "x_target_normalized": [
+    [
+      0.9327633113097552,
+      0.9336099585062241,
+      0.9646302250803859,
+      0.6797583081570997
+    ]
+  ],
+  "pattern_features_max": [
+    0.5360416666666666,
+    0.964,
+    0.311,
+    2.648
+  ],
+  "features": [
+    "average_power(kW)",
+    "max_power(kW)",
+    "min_power(kW)",
+    "fluctuation_power(kW)"
+  ],
+  "num_samples": 10,
+  "normalization_max": 0.964
+}
