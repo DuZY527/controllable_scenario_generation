@@ -307,49 +307,82 @@ class TimeEmbedding(nn.Module):  # 复制之前的TimeEmbedding类
         return emb
 
 
-class DenoiseNet(nn.Module):
-    """去噪网络：输入(潜在向量z + 时间步嵌入t_emb + 模式嵌入p_emb) → 输出预测噪声"""
-    def __init__(self, latent_dim: int = 64, pattern_embed_dim: int = 512, time_emb_base_dim: int = 32):
+class TemporalResBlock1D(nn.Module):
+    def __init__(self, channels: int, dilation: int):
         super().__init__()
-        # 时间步嵌入
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(num_groups=8, num_channels=channels)
+        self.norm2 = nn.GroupNorm(num_groups=8, num_channels=channels)
+
+    def forward(self, x, gamma, beta):
+        # gamma/beta: (B, C, 1)
+        h = self.conv1(x)
+        h = self.norm1(h)
+        h = h * (1.0 + gamma) + beta
+        h = F.silu(h)
+
+        h = self.conv2(h)
+        h = self.norm2(h)
+        h = F.silu(h)
+
+        return x + h
+
+
+class DenoiseNet(nn.Module):
+    """
+    输入:
+      z: (B, latent_dim)
+      t: (B,)
+      p_emb: (B, pattern_embed_dim)
+    输出:
+      eps_pred: (B, latent_dim)
+    """
+    def __init__(self, latent_dim: int = 128, pattern_embed_dim: int = 512, time_emb_base_dim: int = 32, hidden_ch: int = 64):
+        super().__init__()
         self.time_emb = TimeEmbedding(dim=time_emb_base_dim)
         self.time_emb_out_dim = 4 * time_emb_base_dim
-        # 模式嵌入映射
+
+        # 条件分支
         self.pattern_fc = nn.Linear(pattern_embed_dim, latent_dim)
-        # 去噪主干网络（全连接）
-        total_input_dim = latent_dim + self.time_emb_out_dim + latent_dim   # z + t_emb + p_emb
-        self.denoise_fc = nn.Sequential(
-            nn.Linear(total_input_dim, 256),  # z + t_emb + p_emb
-            nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Linear(128, latent_dim)  # 输出与z同维度的噪声
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(self.time_emb_out_dim + latent_dim, hidden_ch * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_ch * 2, hidden_ch * 2)
         )
-        # print(f"DenoiseNet配置:")
-        # print(f"  - 潜在向量维度: {latent_dim}")
-        # print(f"  - 时间嵌入维度: {self.time_emb_out_dim}")
-        # print(f"  - 模式嵌入维度: {latent_dim} (映射后)")
-        # print(f"  - 总输入维度: {total_input_dim}")
+
+        # 时序去噪主干
+        self.in_proj = nn.Conv1d(1, hidden_ch, kernel_size=3, padding=1)
+        self.blocks = nn.ModuleList([
+            TemporalResBlock1D(hidden_ch, dilation=1),
+            TemporalResBlock1D(hidden_ch, dilation=2),
+            TemporalResBlock1D(hidden_ch, dilation=4),
+            TemporalResBlock1D(hidden_ch, dilation=8),
+        ])
+        self.out_proj = nn.Sequential(
+            nn.Conv1d(hidden_ch, hidden_ch, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(hidden_ch, 1, kernel_size=3, padding=1)
+        )
 
     def forward(self, z: torch.Tensor, t: torch.Tensor, p_emb: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: 加噪后的潜在向量，(B, latent_dim)
-            t: 时间步，(B,)
-            p_emb: 模式嵌入，(B, 512)
-        Returns:
-            eps_pred: 预测的噪声，(B, latent_dim)
-        """
-        # 时间步嵌入
-        t_emb = self.time_emb(t)  # (B, time_emb_dim)
-        # 模式嵌入映射
-        p_emb = self.pattern_fc(p_emb)  # (B, latent_dim)
-        # 拼接输入
-        x = torch.cat([z, t_emb, p_emb], dim=1)  # (B, 3*latent_dim)
-        # 预测噪声
-        return self.denoise_fc(x)
+        z_seq = z.unsqueeze(1)  # (B, 1, L)
+
+        t_emb = self.time_emb(t)                # (B, time_emb_out_dim)
+        p_cond = self.pattern_fc(p_emb)         # (B, latent_dim)
+        cond = torch.cat([t_emb, p_cond], dim=1)
+
+        gamma_beta = self.cond_mlp(cond)        # (B, 2*hidden_ch)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
+        gamma = gamma.unsqueeze(-1)             # (B, C, 1)
+        beta = beta.unsqueeze(-1)               # (B, C, 1)
+
+        h = self.in_proj(z_seq)
+        for blk in self.blocks:
+            h = blk(h, gamma, beta)
+
+        eps = self.out_proj(h).squeeze(1)       # (B, latent_dim)
+        return eps
 
 
 class LatentDiffusionModel(nn.Module):
@@ -552,4 +585,130 @@ def train_pgdm(
                   f"Avg Total Loss: {avg_total_loss:.4f}, "
                   f"VAE Loss: {avg_vae_loss:.4f}, "
                   f"Diffusion Loss: {avg_diffusion_loss:.4f}")
+    return model
+
+
+# Override with robust checkpoint version.
+def train_pgdm(
+        model: PGDM,
+        train_loader: DataLoader,
+        epochs: int = 800,
+        lr: float = 1e-3,
+        device: torch.device = torch.device("cpu"),
+        save_every: int = 50,
+        checkpoint_path: str = "pgdm_checkpoint.pth",
+        best_model_path: str = "pgdm_model_best.pth",
+        resume: bool = True
+):
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    save_every = max(1, int(save_every))
+    start_epoch = 0
+    best_total_loss = float("inf")
+
+    def _save_training_checkpoint(epoch_idx: int, current_total_loss: float) -> None:
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        torch.save(
+            {
+                "epoch": epoch_idx,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_total_loss": float(best_total_loss),
+                "current_total_loss": float(current_total_loss),
+            },
+            checkpoint_path
+        )
+
+    if resume and os.path.exists(checkpoint_path):
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            best_total_loss = float(checkpoint.get("best_total_loss", float("inf")))
+            start_epoch = int(checkpoint.get("epoch", -1)) + 1
+            if start_epoch < epochs:
+                print(f"Resume PGDM training from epoch {start_epoch + 1}/{epochs}")
+            else:
+                print("PGDM checkpoint already reached target epochs, training will stop.")
+        except Exception as e:
+            print(f"Warning: failed to load PGDM checkpoint, start from scratch. Error: {e}")
+            start_epoch = 0
+            best_total_loss = float("inf")
+
+    epoch = start_epoch - 1
+    total_loss_epoch = 0.0
+    seen_samples = 0
+
+    try:
+        for epoch in range(start_epoch, epochs):
+            model.train()
+            total_loss_epoch = 0.0
+            total_vae_loss_epoch = 0.0
+            total_diffusion_loss_epoch = 0.0
+            seen_samples = 0
+
+            for y_batch, x_batch in train_loader:
+                y_batch = y_batch.to(device)
+                x_batch = x_batch.to(device)
+                total_loss, vae_loss, diffusion_loss = model(y_batch, x_batch)
+
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+
+                batch_size = y_batch.shape[0]
+                seen_samples += batch_size
+                total_loss_epoch += total_loss.item() * batch_size
+                total_vae_loss_epoch += vae_loss.item() * batch_size
+                total_diffusion_loss_epoch += diffusion_loss.item() * batch_size
+
+            dataset_size = max(len(train_loader.dataset), 1)
+            avg_total_loss = total_loss_epoch / dataset_size
+            avg_vae_loss = total_vae_loss_epoch / dataset_size
+            avg_diffusion_loss = total_diffusion_loss_epoch / dataset_size
+            scheduler.step()
+
+            if avg_total_loss < best_total_loss:
+                best_total_loss = avg_total_loss
+                best_model_dir = os.path.dirname(best_model_path)
+                if best_model_dir:
+                    os.makedirs(best_model_dir, exist_ok=True)
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "best_total_loss": float(best_total_loss),
+                        "model_state_dict": model.state_dict(),
+                    },
+                    best_model_path
+                )
+
+            if (epoch + 1) % save_every == 0 or (epoch + 1) == epochs:
+                _save_training_checkpoint(epoch, avg_total_loss)
+                print(
+                    f"[Checkpoint] PGDM epoch {epoch + 1}/{epochs}, "
+                    f"current_total_loss={avg_total_loss:.4f}, best_total_loss={best_total_loss:.4f}"
+                )
+
+            if (epoch + 1) % 50 == 0 or epoch < 50:
+                print(
+                    f"Epoch [{epoch + 1}/{epochs}], "
+                    f"Avg Total Loss: {avg_total_loss:.4f}, "
+                    f"VAE Loss: {avg_vae_loss:.4f}, "
+                    f"Diffusion Loss: {avg_diffusion_loss:.4f}"
+                )
+    except KeyboardInterrupt:
+        interrupted_avg_total = (
+            total_loss_epoch / max(seen_samples, 1) if seen_samples > 0 else best_total_loss
+        )
+        _save_training_checkpoint(epoch, interrupted_avg_total)
+        print(
+            f"\nTraining interrupted. Checkpoint saved at epoch {max(epoch + 1, 0)} "
+            f"to {checkpoint_path}"
+        )
+
     return model

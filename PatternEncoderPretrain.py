@@ -297,3 +297,119 @@ def train_contrastive_model(
 
     return model
 
+
+# Override with robust checkpoint version.
+def train_contrastive_model(
+        model: ContrastivePretrainModel,
+        train_loader: DataLoader,
+        epochs: int = 10000,
+        lr: float = 1e-3,
+        device: torch.device = torch.device("cpu"),
+        save_every: int = 50,
+        checkpoint_path: str = "contrastive_pretrain_checkpoint.pth",
+        best_model_path: str = "contrastive_pretrain_model_best.pth",
+        resume: bool = True
+):
+    """Train contrastive model with periodic checkpointing and auto-resume support."""
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    save_every = max(1, int(save_every))
+    start_epoch = 0
+    best_loss = float("inf")
+
+    def _save_training_checkpoint(epoch_idx: int, current_loss: float) -> None:
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        torch.save(
+            {
+                "epoch": epoch_idx,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_loss": float(best_loss),
+                "current_loss": float(current_loss),
+            },
+            checkpoint_path
+        )
+
+    if resume and os.path.exists(checkpoint_path):
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            best_loss = float(checkpoint.get("best_loss", float("inf")))
+            start_epoch = int(checkpoint.get("epoch", -1)) + 1
+            if start_epoch < epochs:
+                print(f"Resume contrastive training from epoch {start_epoch + 1}/{epochs}")
+            else:
+                print("Contrastive checkpoint already reached target epochs, training will stop.")
+        except Exception as e:
+            print(f"Warning: failed to load contrastive checkpoint, start from scratch. Error: {e}")
+            start_epoch = 0
+            best_loss = float("inf")
+
+    print("Start contrastive pretraining...")
+    epoch = start_epoch - 1
+    total_loss = 0.0
+    num_batches = 0
+
+    try:
+        for epoch in range(start_epoch, epochs):
+            model.train()
+            total_loss = 0.0
+            num_batches = 0
+
+            for y_batch, x_batch in train_loader:
+                y_batch = y_batch.to(device)
+                x_batch = x_batch.to(device)
+
+                p_emb, s_emb, p_multi_scale, s_multi_scale = model(x_batch, y_batch)
+                loss = model.compute_loss(p_emb, s_emb, p_multi_scale, s_multi_scale)
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            scheduler.step()
+            avg_loss = total_loss / max(num_batches, 1)
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_dir = os.path.dirname(best_model_path)
+                if best_model_dir:
+                    os.makedirs(best_model_dir, exist_ok=True)
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "best_loss": float(best_loss),
+                        "model_state_dict": model.state_dict(),
+                    },
+                    best_model_path
+                )
+
+            if (epoch + 1) % save_every == 0 or (epoch + 1) == epochs:
+                _save_training_checkpoint(epoch, avg_loss)
+                print(
+                    f"[Checkpoint] contrastive epoch {epoch + 1}/{epochs}, "
+                    f"current_loss={avg_loss:.4f}, best_loss={best_loss:.4f}"
+                )
+
+            if (epoch + 1) % 100 == 0 or epoch < 20:
+                print(f"Epoch [{epoch + 1}/{epochs}], Avg Contrastive Loss: {avg_loss:.4f}")
+    except KeyboardInterrupt:
+        interrupted_loss = total_loss / max(num_batches, 1) if num_batches > 0 else best_loss
+        _save_training_checkpoint(epoch, interrupted_loss)
+        print(
+            f"\nTraining interrupted. Checkpoint saved at epoch {max(epoch + 1, 0)} "
+            f"to {checkpoint_path}"
+        )
+
+    return model
+

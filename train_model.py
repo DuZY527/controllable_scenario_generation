@@ -1,3 +1,5 @@
+import sys
+print("当前Python解释器路径:", sys.executable)
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
@@ -15,7 +17,7 @@ print("CUDA是否可用：", torch.cuda.is_available())  # 输出True表示GPU�
 print("GPU数量：", torch.cuda.device_count())  # 输出GPU数量（≥1即正常）
 # 1. 加载本地数据集
 excel_file_path = \
-        r"D:\科研\可控场景生成\Diffusion model\diffusion model for controllable scenario generation\dataset\PVdata.xlsx"
+        r"D:\Controllable_weekly_scenario_generation\controllable_scenario_generation\dataset\PVdata.xlsx"
 result = excel8760_to_weekly168_npy(
         excel_path=excel_file_path,
         sheet_name=None,  # 读取所有sheet
@@ -23,7 +25,7 @@ result = excel8760_to_weekly168_npy(
 )
 # 加载数据
 NPY_FILE_PATH = \
-        r"D:\科研\可控场景生成\Diffusion model\diffusion model for controllable scenario generation\dataset\PVdata.npy"
+        r"D:\Controllable_weekly_scenario_generation\controllable_scenario_generation\dataset\PVdata.npy"
 train_dataset = PVDataSet(npy_file_path=NPY_FILE_PATH, normalize=True, max_power=None)
 # train_dataset = WDDataSet(npy_file_path=NPY_FILE_PATH, normalize=True, max_power=None)
 train_loader = DataLoader(
@@ -33,11 +35,11 @@ train_loader = DataLoader(
         drop_last=True
 )
 # ---------------------- 3. 初始化模型 ----------------------#
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cpu")
 print(f"✅ 使用设备：{device}")
 # ---------------------- 第一步：预训练对比学习模型 ----------------------
-print("\n=== 第一步：预训练对比学习模型 ===")
+# print("\n=== 第一步：预训练对比学习模型 ===")
 contrastive_model = ContrastivePretrainModel(
         pattern_input_dim=7,
         scenario_seq_len=168,
@@ -47,9 +49,13 @@ contrastive_model = ContrastivePretrainModel(
 contrastive_model = train_contrastive_model(
         model=contrastive_model,
         train_loader=train_loader,
-        epochs=800,
+        epochs=1000,
         lr=1e-3,
-        device=device
+        device=device,
+        save_every=50,
+        checkpoint_path="contrastive_pretrain_checkpoint.pth",
+        best_model_path="contrastive_pretrain_model_best.pth",
+        resume=True
 )
 # 保存预训练模型
 torch.save(contrastive_model.state_dict(), "contrastive_pretrain_model.pth")
@@ -71,9 +77,13 @@ print("\n开始训练PGDM模型...")
 pgdm_model = train_pgdm(
         model=pgdm_model,
         train_loader=train_loader,
-        epochs=1000,
+        epochs=1200,
         lr=1e-3,
-        device=device
+        device=device,
+        save_every=50,
+        checkpoint_path="pgdm_pv_checkpoint.pth",
+        best_model_path="pgdm_pv_model_best.pth",
+        resume=True
 )
 # 保存模型（含归一化信息，方便后续生成时反归一化）
 save_dict = {

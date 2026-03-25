@@ -1,198 +1,328 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from k_mediods_analysis import typical_scenarios_pattern
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from data_uti import PVDataSet
+
+TOTAL_FEATURE_NAMES = [
+    "weekly_total_power",
+    "weekly_peak_power",
+    "svd_entropy",
+    "mean_daily_entropy",
+    "mean_hourly_entropy",
+    "daily_total_cv",
+    "avg_sunlight_hours",
+]
+
+VECTOR_FEATURE_META = [
+    ("interday_max_change_rate", "interday_max_change_rate_day"),
+    ("intraday_diff_mean", "intraday_diff_mean_day"),
+    ("intraday_diff_var", "intraday_diff_var_day"),
+]
 
 
-def excel8760_to_daily24(excel_path, output_npy_path=None, sheet_name=None, skip_header=1):
+def load_pv_multiscale_features(npy_path: Path) -> np.ndarray:
+    dataset = PVDataSet(npy_file_path=str(npy_path), normalize=False, max_power=None)
+    features = dataset.feature_matrix.detach().cpu().numpy().astype(np.float64)
+    if features.ndim != 3 or features.shape[1:] != (4, 7):
+        raise ValueError(f"Expected feature shape (N, 4, 7), but got {features.shape}.")
+    return features
+
+
+def build_distance_matrix(features: np.ndarray, chunk_size: int = 128) -> np.ndarray:
     """
-    将Excel中的8760长度数据分割为1*168的周数据
-    参数：
-    excel_path: Excel文件路径（str或Path）
-    sheet_name: 要读取的sheet名称，None表示读取所有sheet
-    skip_header: 跳过Excel开头的行数（表头），默认1（跳过第一行表头）
+    Mixed distance required by user:
+    1) scalar features (features[:, 0, :]) -> sum(abs diff)
+    2) vector features (features[:, 1:, :]) -> Euclidean distance on each vector, then sum
     """
-    # 处理输出路径
-    if output_npy_path is None:
-        excel_path = Path(excel_path)
-    # 存储所有1*168的数据
-    all_weekly_data = []
-    # 读取Excel文件
-    if sheet_name is None:
-        # 读取所有sheet
-        excel_file = pd.ExcelFile(excel_path)
-        sheet_names = excel_file.sheet_names
-    else:
-        sheet_names = [sheet_name]
-    for sheet in sheet_names:
-        print(f"正在处理sheet: {sheet}")
-        # 读取当前sheet数据（跳过表头）
-        df = pd.read_excel(excel_path, sheet_name=sheet, skiprows=skip_header)
-        # 遍历每一列（每列应为8760长度的数据）
-        for col_name in df.columns:
-            # 获取列数据，去除NaN值，转换为numpy数组
-            col_data = df[col_name].dropna().values
-            # 验证数据长度是否为8760
-            if len(col_data) != 8760:
-                print(f"警告：列 '{col_name}' 的长度为 {len(col_data)}，不是8760，已跳过该列")
-                continue
-            print(f"正在处理列: {col_name} (8760个数据点)")
-            # reshape为(52, 168)，每个行向量是1*24的日数据
-            weekly_data = col_data[:8781].reshape(-1, 24)
-            # 验证分割后的数据形状
-            if weekly_data.shape != (365, 24):
-                print(f"警告：列 '{col_name}' 分割后形状为 {weekly_data.shape}，不是(365,24)，已跳过该列")
-                continue
-            # 将当前列的zhou数据添加到总列表
-            all_weekly_data.append(weekly_data)
-    # 合并所有数据（形状：(总样本数, 168)）
-    if all_weekly_data:
-        final_data = np.concatenate(all_weekly_data, axis=0)
-        final_data = final_data.reshape(-1, 1, 24)
-        print(f"\n数据处理完成！")
-        print(f"原始数据：{len(all_weekly_data)} 列 × 8760 个数据点")
-        print(f"分割后：{final_data.shape[0]} 个1×24的周数据样本")
-        return final_data
-    else:
-        print("错误：没有找到有效的8760长度数据列！")
-        return None
+    n_samples = features.shape[0]
+    scalar_features = features[:, 0, :]  # (N, 7)
+    vector_features = features[:, 1:, :]  # (N, 3, 7)
+
+    distance_matrix = np.zeros((n_samples, n_samples), dtype=np.float64)
+
+    for start in range(0, n_samples, chunk_size):
+        end = min(start + chunk_size, n_samples)
+
+        scalar_chunk = scalar_features[start:end]  # (B, 7)
+        scalar_dist = np.sum(
+            np.abs(scalar_chunk[:, np.newaxis, :] - scalar_features[np.newaxis, :, :]),
+            axis=2,
+        )
+
+        vector_dist = np.zeros((end - start, n_samples), dtype=np.float64)
+        for block_idx in range(vector_features.shape[1]):
+            block_chunk = vector_features[start:end, block_idx, :]  # (B, 7)
+            full_block = vector_features[:, block_idx, :]  # (N, 7)
+            diff = block_chunk[:, np.newaxis, :] - full_block[np.newaxis, :, :]
+            vector_dist += np.linalg.norm(diff, axis=2)
+
+        distance_matrix[start:end] = scalar_dist + vector_dist
+
+    np.fill_diagonal(distance_matrix, 0.0)
+    return distance_matrix
 
 
-def excel8760_to_weekly168_npy(excel_path, output_npy_path=None, sheet_name=None, skip_header=1):
+def initialize_medoids(distance_matrix: np.ndarray, n_clusters: int, random_state: int) -> np.ndarray:
+    rng = np.random.default_rng(random_state)
+    n_samples = distance_matrix.shape[0]
+
+    medoids = [int(rng.integers(n_samples))]
+    all_indices = np.arange(n_samples)
+
+    while len(medoids) < n_clusters:
+        min_dist = np.min(distance_matrix[:, medoids], axis=1)
+        min_dist[medoids] = 0.0
+        total = float(np.sum(min_dist))
+
+        if total <= 0:
+            remaining = np.setdiff1d(all_indices, np.array(medoids), assume_unique=False)
+            new_medoid = int(rng.choice(remaining))
+        else:
+            probs = min_dist / total
+            new_medoid = int(rng.choice(n_samples, p=probs))
+            while new_medoid in medoids:
+                new_medoid = int(rng.choice(n_samples, p=probs))
+
+        medoids.append(new_medoid)
+
+    return np.array(medoids, dtype=int)
+
+
+def kmedoids_precomputed(
+    distance_matrix: np.ndarray,
+    n_clusters: int,
+    max_iter: int = 200,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    n_samples = distance_matrix.shape[0]
+    if n_clusters <= 0 or n_clusters > n_samples:
+        raise ValueError("n_clusters must be in [1, n_samples].")
+
+    medoids = initialize_medoids(distance_matrix, n_clusters, random_state)
+
+    for _ in range(max_iter):
+        distances_to_medoids = distance_matrix[:, medoids]
+        labels = np.argmin(distances_to_medoids, axis=1)
+
+        new_medoids = medoids.copy()
+        for cluster_id in range(n_clusters):
+            cluster_indices = np.where(labels == cluster_id)[0]
+            if cluster_indices.size == 0:
+                continue
+
+            intra_dist = distance_matrix[np.ix_(cluster_indices, cluster_indices)]
+            costs = np.sum(intra_dist, axis=1)
+            best_local_idx = int(np.argmin(costs))
+            new_medoids[cluster_id] = int(cluster_indices[best_local_idx])
+
+        if np.array_equal(new_medoids, medoids):
+            break
+        medoids = new_medoids
+
+    final_distances = distance_matrix[:, medoids]
+    final_labels = np.argmin(final_distances, axis=1)
+    cluster_sizes = [int(np.sum(final_labels == cid)) for cid in range(n_clusters)]
+    cluster_weights = [size / n_samples for size in cluster_sizes]
+
+    return {
+        "medoid_indices": medoids,
+        "labels": final_labels,
+        "cluster_sizes": cluster_sizes,
+        "cluster_weights": cluster_weights,
+    }
+
+
+def build_feature_ranges(features: np.ndarray) -> dict[str, Any]:
+    scalar_features = features[:, 0, :]
+    vector_features = features[:, 1:, :]
+
+    scalar_min = np.min(scalar_features, axis=0)
+    scalar_max = np.max(scalar_features, axis=0)
+
+    ranges: dict[str, Any] = {"scalar_features": {}}
+    for i, name in enumerate(TOTAL_FEATURE_NAMES):
+        ranges["scalar_features"][name] = {
+            "min": float(scalar_min[i]),
+            "max": float(scalar_max[i]),
+        }
+
+    ranges["vector_features"] = {}
+    for block_idx, (block_name, dim_prefix) in enumerate(VECTOR_FEATURE_META):
+        block_data = vector_features[:, block_idx, :]  # (N, 7)
+        block_min = np.min(block_data, axis=0)
+        block_max = np.max(block_data, axis=0)
+        ranges["vector_features"][block_name] = {
+            "min": [float(v) for v in block_min],
+            "max": [float(v) for v in block_max],
+            "dimension_names": [f"{dim_prefix}{d + 1}" for d in range(7)],
+        }
+
+    return ranges
+
+
+def build_center_output(features: np.ndarray, clustering_result: dict[str, Any]) -> list[dict[str, Any]]:
+    centers: list[dict[str, Any]] = []
+    medoid_indices = clustering_result["medoid_indices"]
+    cluster_sizes = clustering_result["cluster_sizes"]
+    cluster_weights = clustering_result["cluster_weights"]
+
+    for cluster_id, medoid_idx in enumerate(medoid_indices.tolist()):
+        center_feature = features[medoid_idx]  # (4, 7)
+        scalar_part = center_feature[0]
+
+        center_info: dict[str, Any] = {
+            "cluster_id": int(cluster_id),
+            "medoid_sample_index": int(medoid_idx),
+            "cluster_size": int(cluster_sizes[cluster_id]),
+            "cluster_weight": float(cluster_weights[cluster_id]),
+            "scalar_features": {
+                name: float(scalar_part[idx]) for idx, name in enumerate(TOTAL_FEATURE_NAMES)
+            },
+            "vector_features": {
+                VECTOR_FEATURE_META[0][0]: [float(v) for v in center_feature[1]],
+                VECTOR_FEATURE_META[1][0]: [float(v) for v in center_feature[2]],
+                VECTOR_FEATURE_META[2][0]: [float(v) for v in center_feature[3]],
+            },
+        }
+        centers.append(center_info)
+
+    return centers
+
+
+def save_medoids_pattern_excel(features: np.ndarray, clustering_result: dict[str, Any], output_path: Path) -> None:
     """
-    将Excel中的8760长度数据分割为1*168的周数据，并保存为npy文件
-    参数：
-    excel_path: Excel文件路径（str或Path）
-    output_npy_path: 输出npy文件路径，默认与Excel同目录同文件名.npy
-    sheet_name: 要读取的sheet名称，None表示读取所有sheet
-    skip_header: 跳过Excel开头的行数（表头），默认1（跳过第一行表头）
+    保存聚类中心模式到Excel表格
+    
+    Args:
+        features: 特征矩阵，形状为 (N, 4, 7)
+        clustering_result: 聚类结果，包含medoid_indices
+        output_path: 输出Excel文件路径
     """
-    # 处理输出路径
-    if output_npy_path is None:
-        excel_path = Path(excel_path)
-        output_npy_path = excel_path.parent / f"{excel_path.stem}.npy"
-    # 存储所有1*24的数据
-    all_weekly_data = []
-    # 读取Excel文件
-    if sheet_name is None:
-        # 读取所有sheet
-        excel_file = pd.ExcelFile(excel_path)
-        sheet_names = excel_file.sheet_names
-    else:
-        sheet_names = [sheet_name]
-    for sheet in sheet_names:
-        print(f"正在处理sheet: {sheet}")
-        # 读取当前sheet数据（跳过表头）
-        df = pd.read_excel(excel_path, sheet_name=sheet, skiprows=skip_header)
-        # 遍历每一列（每列应为8760长度的数据）
-        for col_name in df.columns:
-            # 获取列数据，去除NaN值，转换为numpy数组
-            col_data = df[col_name].dropna().values
-            # 验证数据长度是否为8760
-            if len(col_data) != 8760:
-                print(f"警告：列 '{col_name}' 的长度为 {len(col_data)}，不是8760，已跳过该列")
-                continue
-            print(f"正在处理列: {col_name} (8760个数据点)")
-            # reshape为(-,24)，每个行向量是1*24的日数据
-            weekly_data = col_data[:8736].reshape(-1, 168)
-            # 验证分割后的数据形状
-            if weekly_data.shape != (52, 168):
-                print(f"警告：列 '{col_name}' 分割后形状为 {weekly_data.shape}，不是(365,24)，已跳过该列")
-                continue
-            # 将当前列的日数据添加到总列表
-            all_weekly_data.append(weekly_data)
-    # 合并所有数据（形状：(总样本数, 24)）
-    if all_weekly_data:
-        final_data = np.concatenate(all_weekly_data, axis=0)
-        final_data = final_data.reshape(-1, 1, 168)
-        # 保存为npy文件
-        np.save(output_npy_path, final_data)
-        print(f"\n数据处理完成！")
-        print(f"原始数据：{len(all_weekly_data)} 列 × 8760 个数据点")
-        print(f"分割后：{final_data.shape[0]} 个1×168的日数据样本")
-        print(f"保存路径：{output_npy_path}")
-        return final_data
-    else:
-        print("错误：没有找到有效的8760长度数据列！")
-        return None
-
-# 数据引入
-excel_file_path = \
-        r"D:\科研\可控场景生成\Diffusion model\diffusion model for controllable scenario generation\dataset\PVdata.xlsx"
-weekly_data = excel8760_to_weekly168_npy(
-            excel_path=excel_file_path,
-            sheet_name=None,  # 读取所有sheet
-            skip_header=0
-            )
-total_patterns = []
-data_set = "pv"
-# 全局特征
-for i in range(weekly_data.shape[0]):
-    daily_max = []
-    daily_mean = []
-    # 提取第i个1×168向量并展平
-    vector = weekly_data[i, 0, :].flatten()
-    # 计算各项特征
-    max_val = np.max(vector)
-    mean_val = np.mean(vector)
-    # 最小值（wd）
-    min_val = np.min(vector)
-    # 非零数比例（pv）
-    non_zero_ratio = np.count_nonzero(vector)
-    # 相邻差值绝对值的最大值（包括首尾相连）
-    for j in range(7):
-        daily_max.append(np.max(vector[24 * j: 24 * (j + 1)]))
-        daily_mean.append(np.mean(vector[24 * j:24 * (j + 1)]))
-    # 4.最大值波动值
-    max_fluc = np.sum(np.abs(daily_max - np.roll(daily_max, 1)))
-    # 5.平均值波动值
-    mean_fluc = np.sum(np.abs(daily_mean - np.roll(daily_mean, 1)))
-    # 6. 前后两小时光伏数据差值的平均值（一阶差分均值）
-    vector_rolled = np.roll(vector, 1)
-    diff = vector - vector_rolled  # 前后两小时差值
-    diff_mean = np.mean(np.abs(diff))  # 差值的绝对值平均值
-    # 7. 前后两小时光伏数据差值的方差（一阶差分方差）
-    diff_var = np.var(np.abs(diff))  # 差值的绝对值方差
-    if data_set == "pv":
-        pattern = [max_val, mean_val, non_zero_ratio, max_fluc, mean_fluc, diff_mean, diff_var]
-    elif data_set == "wd":
-        pattern = [max_val, mean_val, min_val]
-    else:
-        raise ValueError("不正确数据类型，请使用pv or wd")
-    total_patterns.append(pattern)
-
-max_values_global = np.max([r[0] for r in total_patterns])
-min_max_values_global = np.min([r[0] for r in total_patterns])
-max_mean_values_global = np.max([r[1] for r in total_patterns])
-min_mean_values_global = np.min([r[1] for r in total_patterns])
-max_non_zero_ratios_global = np.max([r[2] for r in total_patterns])
-min_non_zero_ratios_global = np.min([r[2] for r in total_patterns])
-max_maxfluc_global = np.max([r[3] for r in total_patterns])
-min_maxfluc_global = np.min([r[3] for r in total_patterns])
-max_meanfluc_global = np.max([r[4] for r in total_patterns])
-min_meanfluc_global = np.min([r[4] for r in total_patterns])
-max_diffsmean_global = np.max([r[5] for r in total_patterns])
-min_diffsmean_global = np.min([r[5] for r in total_patterns])
-max_diffsvar_global = np.max([r[6] for r in total_patterns])
-min_diffsvar_global = np.min([r[6] for r in total_patterns])
-pattern_max = [max_values_global, max_mean_values_global, max_non_zero_ratios_global, max_maxfluc_global, max_meanfluc_global, max_diffsmean_global,max_diffsvar_global]
-pattern_min = [min_max_values_global, min_mean_values_global, min_non_zero_ratios_global, min_maxfluc_global, min_meanfluc_global, min_diffsmean_global,min_diffsvar_global]
-print("总体统计信息:")
-print(f"最大范围:{max_values_global:.4f}~{min_max_values_global:.4f}")
-print(f"平均值范围：{max_mean_values_global:.4f}~{min_mean_values_global:.4f}")
-print(f"光照时长/最小值范围:{max_non_zero_ratios_global:.4f}~{min_non_zero_ratios_global:.4f}")
-print(f"日际波动值最大值范围：{max_maxfluc_global:.4f}~{min_maxfluc_global:.4f}")
-print(f"日际波动值均值范围：{max_meanfluc_global:.4f}~{min_meanfluc_global:.4f}")
-print(f"波动值均值范围：{max_diffsmean_global:.4f}~{min_diffsmean_global:.4f}")
-print(f"波动值方差范围：{max_diffsvar_global:.4f}~{min_diffsvar_global:.4f}")
-
-print("\n开始K-medoids聚类分析...")
-km_result = typical_scenarios_pattern(total_patterns, pattern_max, pattern_min)
-medoid_indices = km_result['medoid_indices']
-cluster_sizes = km_result['cluster_sizes']
-cluster_weights = km_result['cluster_weights']
+    medoid_indices = clustering_result["medoid_indices"]
+    n_clusters = len(medoid_indices)
+    
+    # 准备数据
+    data = []
+    
+    # 第一行：节点编号
+    node_row = ["节点编号"] + [f"Node {i}" for i in range(n_clusters)]
+    data.append(node_row)
+    
+    # 第二行：7个标量特征名称
+    feature_row = ["特征名称"] + TOTAL_FEATURE_NAMES
+    data.append(feature_row)
+    
+    # 第三~六行：特征矩阵
+    feature_types = ["标量特征", "向量特征1", "向量特征2", "向量特征3"]
+    for i in range(4):
+        row = [feature_types[i]]
+        for medoid_idx in medoid_indices:
+            # 提取该medoid的第i层特征
+            medoid_feature = features[medoid_idx][i]
+            row.extend([f"{v:.4f}" for v in medoid_feature])
+        data.append(row)
+    
+    # 创建DataFrame
+    df = pd.DataFrame(data)
+    
+    # 保存到Excel
+    df.to_excel(output_path, index=False, header=False)
+    print(f"✅ 聚类中心模式已保存到：{output_path}")
 
 
+def run(
+    npy_path: Path,
+    n_clusters: int,
+    random_state: int,
+    max_iter: int,
+    chunk_size: int,
+    output_json: Path,
+) -> dict[str, Any]:
+    features = load_pv_multiscale_features(npy_path)
+    distance_matrix = build_distance_matrix(features, chunk_size=chunk_size)
+
+    clustering_result = kmedoids_precomputed(
+        distance_matrix=distance_matrix,
+        n_clusters=n_clusters,
+        max_iter=max_iter,
+        random_state=random_state,
+    )
+
+    output = {
+        "dataset": str(npy_path),
+        "n_samples": int(features.shape[0]),
+        "n_clusters": int(n_clusters),
+        "distance_rule": {
+            "scalar": "sum(abs(x_i - y_i))",
+            "vector": "sum(||v_i - v_j||_2) for 3 vector blocks",
+        },
+        "cluster_centers": build_center_output(features, clustering_result),
+        "pv_feature_global_range": build_feature_ranges(features),
+    }
+
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    
+    # 保存Excel表格
+    excel_output = output_json.parent / "mediods_pattern.xlsx"
+    save_medoids_pattern_excel(features, clustering_result, excel_output)
+
+    return output
 
 
+def main() -> None:
+    default_npy = PROJECT_ROOT / "dataset" / "PVdata.npy"
+    default_output = PROJECT_ROOT / "dataset" / "pv_multiscale_cluster_result.json"
 
+    parser = argparse.ArgumentParser(description="Cluster PV multiscale features with mixed distance.")
+    parser.add_argument("--npy-path", type=Path, default=default_npy, help="Path of PV .npy data.")
+    parser.add_argument("--n-clusters", type=int, default=12, help="Number of clusters (default: 12).")
+    parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--max-iter", type=int, default=200)
+    parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--output-json", type=Path, default=default_output)
+    args = parser.parse_args()
+
+    result = run(
+        npy_path=args.npy_path,
+        n_clusters=args.n_clusters,
+        random_state=args.random_state,
+        max_iter=args.max_iter,
+        chunk_size=args.chunk_size,
+        output_json=args.output_json,
+    )
+
+    print(f"Samples: {result['n_samples']}")
+    print(f"Clusters: {result['n_clusters']}")
+    print(f"Result saved to: {args.output_json}")
+
+    print("\n12 cluster centers (all features):")
+    for center in result["cluster_centers"]:
+        print(json.dumps(center, ensure_ascii=False, indent=2))
+
+    print("\nPV global feature min/max range:")
+    print(json.dumps(result["pv_feature_global_range"], ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
