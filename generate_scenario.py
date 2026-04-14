@@ -183,6 +183,7 @@ class ModelLoader:
         ).to(self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         self.model.eval()
+        self.model.pattern_encoder.eval()   # 确保模式编码器在eval模式
 
         self.normalization_max = float(
             checkpoint.get("normalization_max", self.config.get("normalization_max", 1.0))

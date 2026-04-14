@@ -484,6 +484,7 @@ class PGDM(nn.Module):
                 # 冻结模式编码器参数
                 for param in self.pattern_encoder.parameters():
                     param.requires_grad = False
+                self.pattern_encoder.eval()   # 强制设为评估模式
                 print("✅ 模式编码器参数已冻结")
         # 2. 感知VAE
         self.perceptual_vae = PerceptualVAE(seq_len=seq_len, latent_dim=latent_dim)
@@ -504,6 +505,16 @@ class PGDM(nn.Module):
             diffusion_loss: 扩散损失
         """
         B = y.shape[0]
+         # ---------- 安全获取条件嵌入 ----------
+        # 记录当前训练状态
+        is_training = self.pattern_encoder.training
+        self.pattern_encoder.eval()
+        with torch.no_grad():
+            p_emb, _ = self.pattern_encoder(x)          # (B, 512)
+        # 恢复原训练状态
+        if is_training:
+            self.pattern_encoder.train()
+        #---#
         # 1. 对比损失：模式编码器 + 场景编码器
         p_emb, _ = self.pattern_encoder(x)  # (B, 512)
         # 2. 感知VAE损失：重构 + 感知 + KL
