@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import os
+import matplotlib.pyplot as plt
 from typing import Tuple, List
 
 from PatternEncoderPretrain import ContrastivePretrainModel
@@ -556,48 +557,6 @@ class PGDM(nn.Module):
         return y_gen
 
 
-def train_pgdm(
-        model: PGDM, train_loader: DataLoader,
-        epochs: int = 800, lr: float = 1e-3,
-        device: torch.device = torch.device("cpu")
-):
-    model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss_epoch = 0.0
-        total_vae_loss_epoch = 0.0
-        total_diffusion_loss_epoch = 0.0
-        for batch_idx, (y_batch, x_batch) in enumerate(train_loader):
-            # 数据移至设备
-            y_batch = y_batch.to(device)  # (B, 24)
-            x_batch = x_batch.to(device)  # (B, 4)
-            # 前向传播计算损失
-            total_loss, vae_loss, diffusion_loss = model(y_batch, x_batch)
-            # 反向传播优化
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-            # 累加损失
-            total_loss_epoch += total_loss.item() * y_batch.shape[0]
-            total_vae_loss_epoch += vae_loss.item() * y_batch.shape[0]
-            total_diffusion_loss_epoch += diffusion_loss.item() * y_batch.shape[0]
-        # 计算epoch平均损失
-        avg_total_loss = total_loss_epoch / len(train_loader.dataset)
-        avg_vae_loss = total_vae_loss_epoch / len(train_loader.dataset)
-        avg_diffusion_loss = total_diffusion_loss_epoch / len(train_loader.dataset)
-        scheduler.step()
-
-        # 打印日志（每50个epoch）
-        if (epoch + 1) % 50 == 0 or epoch < 50:
-            print(f"Epoch [{epoch + 1}/{epochs}], "
-                  f"Avg Total Loss: {avg_total_loss:.4f}, "
-                  f"VAE Loss: {avg_vae_loss:.4f}, "
-                  f"Diffusion Loss: {avg_diffusion_loss:.4f}")
-    return model
-
 
 # Override with robust checkpoint version.
 def train_pgdm(
@@ -609,7 +568,9 @@ def train_pgdm(
         save_every: int = 50,
         checkpoint_path: str = "pgdm_checkpoint.pth",
         best_model_path: str = "pgdm_model_best.pth",
-        resume: bool = True
+        resume: bool = True,
+        visualize: bool = True,
+        visualize_interval: int = 1
 ):
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -617,6 +578,24 @@ def train_pgdm(
     save_every = max(1, int(save_every))
     start_epoch = 0
     best_total_loss = float("inf")
+    
+    # 用于存储损失值的列表
+    total_loss_history = []
+    vae_loss_history = []
+    diffusion_loss_history = []
+    
+    # 初始化可视化
+    if visualize:
+        plt.ion()  # 启用交互式模式
+        fig, ax = plt.subplots(figsize=(12, 8))
+        total_line, = ax.plot([], [], 'r-', label='Total Loss')
+        vae_line, = ax.plot([], [], 'g-', label='VAE Loss')
+        diffusion_line, = ax.plot([], [], 'b-', label='Diffusion Loss')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('PGDM Training Loss')
+        ax.legend()
+        ax.grid(True)
 
     def _save_training_checkpoint(epoch_idx: int, current_total_loss: float) -> None:
         checkpoint_dir = os.path.dirname(checkpoint_path)
@@ -630,6 +609,9 @@ def train_pgdm(
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_total_loss": float(best_total_loss),
                 "current_total_loss": float(current_total_loss),
+                "total_loss_history": total_loss_history,
+                "vae_loss_history": vae_loss_history,
+                "diffusion_loss_history": diffusion_loss_history,
             },
             checkpoint_path
         )
@@ -642,6 +624,13 @@ def train_pgdm(
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             best_total_loss = float(checkpoint.get("best_total_loss", float("inf")))
             start_epoch = int(checkpoint.get("epoch", -1)) + 1
+            # 加载历史损失
+            if "total_loss_history" in checkpoint:
+                total_loss_history = checkpoint["total_loss_history"]
+            if "vae_loss_history" in checkpoint:
+                vae_loss_history = checkpoint["vae_loss_history"]
+            if "diffusion_loss_history" in checkpoint:
+                diffusion_loss_history = checkpoint["diffusion_loss_history"]
             if start_epoch < epochs:
                 print(f"Resume PGDM training from epoch {start_epoch + 1}/{epochs}")
             else:
@@ -650,6 +639,9 @@ def train_pgdm(
             print(f"Warning: failed to load PGDM checkpoint, start from scratch. Error: {e}")
             start_epoch = 0
             best_total_loss = float("inf")
+            total_loss_history = []
+            vae_loss_history = []
+            diffusion_loss_history = []
 
     epoch = start_epoch - 1
     total_loss_epoch = 0.0
@@ -683,6 +675,11 @@ def train_pgdm(
             avg_vae_loss = total_vae_loss_epoch / dataset_size
             avg_diffusion_loss = total_diffusion_loss_epoch / dataset_size
             scheduler.step()
+            
+            # 记录损失
+            total_loss_history.append(avg_total_loss)
+            vae_loss_history.append(avg_vae_loss)
+            diffusion_loss_history.append(avg_diffusion_loss)
 
             if avg_total_loss < best_total_loss:
                 best_total_loss = avg_total_loss
@@ -712,6 +709,22 @@ def train_pgdm(
                     f"VAE Loss: {avg_vae_loss:.4f}, "
                     f"Diffusion Loss: {avg_diffusion_loss:.4f}"
                 )
+            
+            # 更新可视化
+            if visualize and (epoch + 1) % visualize_interval == 0:
+                total_line.set_data(range(1, len(total_loss_history) + 1), total_loss_history)
+                vae_line.set_data(range(1, len(vae_loss_history) + 1), vae_loss_history)
+                diffusion_line.set_data(range(1, len(diffusion_loss_history) + 1), diffusion_loss_history)
+                ax.relim()
+                ax.autoscale_view()
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                
+                # 保存loss曲线
+                if (epoch + 1) % (save_every * 2) == 0:
+                    loss_plot_path = os.path.join(os.path.dirname(checkpoint_path), "pgdm_loss_visualization.png") if os.path.dirname(checkpoint_path) else "pgdm_loss_visualization.png"
+                    plt.savefig(loss_plot_path, dpi=150, bbox_inches='tight')
+                    print(f"PGDM loss visualization saved to: {loss_plot_path}")
     except KeyboardInterrupt:
         interrupted_avg_total = (
             total_loss_epoch / max(seen_samples, 1) if seen_samples > 0 else best_total_loss
@@ -721,5 +734,13 @@ def train_pgdm(
             f"\nTraining interrupted. Checkpoint saved at epoch {max(epoch + 1, 0)} "
             f"to {checkpoint_path}"
         )
+    finally:
+        # 训练结束后保存最终的loss曲线
+        if visualize:
+            plt.ioff()  # 关闭交互式模式
+            loss_plot_path = os.path.join(os.path.dirname(checkpoint_path), "pgdm_loss_visualization_final.png") if os.path.dirname(checkpoint_path) else "pgdm_loss_visualization_final.png"
+            plt.savefig(loss_plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Final PGDM loss visualization saved to: {loss_plot_path}")
 
     return model

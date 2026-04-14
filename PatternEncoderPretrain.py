@@ -256,47 +256,6 @@ class ContrastivePretrainModel(nn.Module):
         return hierarchical_contrastive_loss(p_emb, s_emb, p_multi_scale, s_multi_scale)
 
 
-def train_contrastive_model(
-        model: ContrastivePretrainModel,
-        train_loader: DataLoader,
-        epochs: int = 10000,
-        lr: float = 1e-3,
-        device: torch.device = torch.device("cpu")
-):
-    """训练对比学习预训练模型"""
-    model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-    print("开始训练对比学习预训练模型...")
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
-        num_batches = 0
-
-        for batch_idx, (y_batch, x_batch) in enumerate(train_loader):
-            y_batch = y_batch.to(device)
-            x_batch = x_batch.to(device)
-            # 前向传播
-            p_emb, s_emb, p_multi_scale, s_multi_scale = model(x_batch, y_batch)
-            loss = model.compute_loss(p_emb, s_emb, p_multi_scale, s_multi_scale)
-            # 反向传播
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-
-        scheduler.step()
-        avg_loss = total_loss / num_batches
-
-        if (epoch + 1) % 100 == 0 or epoch < 20:
-            print(f"预训练 Epoch [{epoch + 1}/{epochs}], 平均对比损失: {avg_loss:.4f}")
-
-    return model
-
 
 # Override with robust checkpoint version.
 def train_contrastive_model(
@@ -308,7 +267,9 @@ def train_contrastive_model(
         save_every: int = 50,
         checkpoint_path: str = "contrastive_pretrain_checkpoint.pth",
         best_model_path: str = "contrastive_pretrain_model_best.pth",
-        resume: bool = True
+        resume: bool = True,
+        visualize: bool = True,
+        visualize_interval: int = 1
 ):
     """Train contrastive model with periodic checkpointing and auto-resume support."""
     model.to(device)
@@ -317,6 +278,20 @@ def train_contrastive_model(
     save_every = max(1, int(save_every))
     start_epoch = 0
     best_loss = float("inf")
+    
+    # 用于存储loss值的列表
+    loss_history = []
+    
+    # 初始化可视化
+    if visualize:
+        plt.ion()  # 启用交互式模式
+        fig, ax = plt.subplots(figsize=(10, 6))
+        line, = ax.plot([], [], 'b-', label='Contractive Loss')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('Contrastive PreTraining Loss')
+        ax.legend()
+        ax.grid(True)
 
     def _save_training_checkpoint(epoch_idx: int, current_loss: float) -> None:
         checkpoint_dir = os.path.dirname(checkpoint_path)
@@ -330,6 +305,7 @@ def train_contrastive_model(
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_loss": float(best_loss),
                 "current_loss": float(current_loss),
+                "loss_history": loss_history,
             },
             checkpoint_path
         )
@@ -342,6 +318,9 @@ def train_contrastive_model(
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             best_loss = float(checkpoint.get("best_loss", float("inf")))
             start_epoch = int(checkpoint.get("epoch", -1)) + 1
+            # 加载历史loss
+            if "loss_history" in checkpoint:
+                loss_history = checkpoint["loss_history"]
             if start_epoch < epochs:
                 print(f"Resume contrastive training from epoch {start_epoch + 1}/{epochs}")
             else:
@@ -350,6 +329,7 @@ def train_contrastive_model(
             print(f"Warning: failed to load contrastive checkpoint, start from scratch. Error: {e}")
             start_epoch = 0
             best_loss = float("inf")
+            loss_history = []
 
     print("Start contrastive pretraining...")
     epoch = start_epoch - 1
@@ -379,6 +359,7 @@ def train_contrastive_model(
 
             scheduler.step()
             avg_loss = total_loss / max(num_batches, 1)
+            loss_history.append(avg_loss)
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
@@ -403,6 +384,20 @@ def train_contrastive_model(
 
             if (epoch + 1) % 100 == 0 or epoch < 20:
                 print(f"Epoch [{epoch + 1}/{epochs}], Avg Contrastive Loss: {avg_loss:.4f}")
+            
+            # 更新可视化
+            if visualize and (epoch + 1) % visualize_interval == 0:
+                line.set_data(range(1, len(loss_history) + 1), loss_history)
+                ax.relim()
+                ax.autoscale_view()
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                
+                # 保存loss曲线
+                if (epoch + 1) % (save_every * 2) == 0:
+                    loss_plot_path = os.path.join(os.path.dirname(checkpoint_path), "loss_visualization.png") if os.path.dirname(checkpoint_path) else "loss_visualization.png"
+                    plt.savefig(loss_plot_path, dpi=150, bbox_inches='tight')
+                    print(f"Loss visualization saved to: {loss_plot_path}")
     except KeyboardInterrupt:
         interrupted_loss = total_loss / max(num_batches, 1) if num_batches > 0 else best_loss
         _save_training_checkpoint(epoch, interrupted_loss)
@@ -410,6 +405,14 @@ def train_contrastive_model(
             f"\nTraining interrupted. Checkpoint saved at epoch {max(epoch + 1, 0)} "
             f"to {checkpoint_path}"
         )
+    finally:
+        # 训练结束后保存最终的loss曲线
+        if visualize:
+            plt.ioff()  # 关闭交互式模式
+            loss_plot_path = os.path.join(os.path.dirname(checkpoint_path), "loss_visualization_final.png") if os.path.dirname(checkpoint_path) else "loss_visualization_final.png"
+            plt.savefig(loss_plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Final loss visualization saved to: {loss_plot_path}")
 
     return model
 
