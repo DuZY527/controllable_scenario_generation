@@ -593,6 +593,7 @@ def train_pgdm(
         diffusion_line, = ax.plot([], [], 'b-', label='Diffusion Loss')
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Loss')
+        ax.set_ylim(0, 1.2)            # 扩散模型 loss 通常较小，可先设小范围
         ax.set_title('PGDM Training Loss')
         ax.legend()
         ax.grid(True)
