@@ -387,16 +387,29 @@ class DenoiseNet(nn.Module):
 
 
 class LatentDiffusionModel(nn.Module):
-    def __init__(self, latent_dim: int = 128, pattern_embed_dim: int = 512, T: int = 100):
+    def __init__(self, latent_dim: int = 128, pattern_embed_dim: int = 512, T: int = 500):
         super().__init__()
         self.T = T  # 扩散步数，参考原文表2
         if T <= 0:
             raise ValueError("T must be positive")
         self.denoise_net = DenoiseNet(latent_dim, pattern_embed_dim)
-        # 预计算扩散系数 β_t, α_t, \bar{α}_t（参考原文 Eq.8-10）
-        self.register_buffer("beta", torch.linspace(1e-4, 0.05, T))  # β从1e-4增至0.05
+        # 使用标准DDPM的beta调度，避免加噪过快
+        self.register_buffer("beta", self._cosine_beta_schedule(T))  # 使用余弦噪声调度，在短T下实现更平滑的加噪
         self.register_buffer("alpha", 1.0 - self.beta)
         self.register_buffer("alpha_bar", torch.cumprod(self.alpha, dim=0))  # \bar{α}_t = product(α_1..α_t)
+
+    def _cosine_beta_schedule(self, timesteps, s=0.008):
+        """
+        余弦噪声调度（来自Improved Denoising Diffusion Probabilistic Models）
+        在短时间步下比线性调度更稳定，避免信号过早淹没
+        """
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps)
+        cosine_s = ((x / timesteps) + s) / (1 + s) * torch.pi / 2
+        alphas_bar = torch.cos(cosine_s) ** 2
+        alphas_bar = alphas_bar / alphas_bar[0]
+        betas = 1 - (alphas_bar[1:] / alphas_bar[:-1])
+        return torch.clip(betas, 0.0001, 0.02)  # 限制beta范围，避免训练不稳定
 
     def forward_diffusion(self, z_0: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -411,11 +424,9 @@ class LatentDiffusionModel(nn.Module):
         B, D = z_0.shape
         # 采样噪声
         eps = torch.randn_like(z_0)  # (B, D)
+        t = t.clamp(0, self.T-1).long()  # 限制时间步范围在0~T-1
         # 获取 \bar{α}_t（按时间步t索引）
-        alpha_bar_t = torch.zeros(B, 1, device=z_0.device)
-        for i in range(B):
-            idx = min(t[i].long().item(), self.T - 1)
-            alpha_bar_t[i] = self.alpha_bar[idx]
+        alpha_bar_t = self.alpha_bar.gather(0, t).unsqueeze(1)
         # 计算 z_t = sqrt(α_bar_t) * z_0 + sqrt(1 - α_bar_t) * eps
         z_t = torch.sqrt(alpha_bar_t) * z_0 + torch.sqrt(1 - alpha_bar_t) * eps
         return z_t, eps

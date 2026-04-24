@@ -61,45 +61,45 @@ contrastive_model = train_contrastive_model(
         save_every=50,
         checkpoint_path="contrastive_pretrain_checkpoint.pth",
         best_model_path="contrastive_pretrain_model_best.pth",
-        resume=False
+        resume=True
 )
 # 保存预训练模型
 torch.save(contrastive_model.state_dict(), "contrastive_pretrain_model.pth")
 print("✅ 对比学习预训练模型保存成功！")
 # ---------------------- 第二步：训练PGDM模型 ----------------------
-# print("\n=== 第二步：训练PGDM模型 ===")
-# # 使用预训练的模式编码器
-# pretrained_pattern_encoder = contrastive_model.pattern_encoder
-# pgdm_model = PGDM(
-#         seq_len=168,
-#         latent_dim=128,
-#         pattern_embed_dim=512,
-#         diffusion_T=100,
-#         pretrained_pattern_encoder=pretrained_pattern_encoder,
-#         freeze_pattern_encoder=False
-# ).to(device)
-# # 训练PGDM模型
-# print("\n开始训练PGDM模型...")
-# pgdm_model = train_pgdm(
-#         model=pgdm_model,
-#         train_loader=train_loader,
-#         epochs=1200,
-#         lr=1e-3,
-#         device=device,
-#         save_every=50,
-#         checkpoint_path="pgdm_pv_checkpoint.pth",
-#         best_model_path="pgdm_pv_model_best.pth",
-#         resume=True
-# )
+print("\n=== 第二步：训练PGDM模型 ===")
+# 使用预训练的模式编码器
+pretrained_pattern_encoder = contrastive_model.pattern_encoder
+pgdm_model = PGDM(
+        seq_len=168,
+        latent_dim=128,
+        pattern_embed_dim=512,
+        diffusion_T=500,
+        pretrained_pattern_encoder=pretrained_pattern_encoder,
+        freeze_pattern_encoder=True
+).to(device)
+# 训练PGDM模型
+print("\n开始训练PGDM模型...")
+pgdm_model = train_pgdm(
+        model=pgdm_model,
+        train_loader=train_loader,
+        epochs=1200,
+        lr=1e-3,
+        device=device,
+        save_every=50,
+        checkpoint_path="pgdm_pv_checkpoint.pth",
+        best_model_path="pgdm_pv_model_best.pth",
+        resume=False
+)
 # 保存模型（含归一化信息，方便后续生成时反归一化）
-# save_dict = {
-#         "model_state_dict": pgdm_model.state_dict(),
-#         "normalization_max": train_dataset.get_normalization_max()  # 保存归一化最大值
-# }
-# torch.save(save_dict, "pgdm_pv_model.pth")
-# print("✅ 模型保存成功！文件：pgdm_pv_model.pth")
-# torch.save(save_dict, "pgdm_wd_model.pth")
-# print("✅ 模型保存成功！文件：pgdm_wd_model.pth")
+save_dict = {
+        "model_state_dict": pgdm_model.state_dict(),
+        "normalization_max": train_dataset.get_normalization_max()  # 保存归一化最大值
+}
+torch.save(save_dict, "pgdm_pv_model.pth")
+print("✅ 模型保存成功！文件：pgdm_pv_model.pth")
+torch.save(save_dict, "pgdm_wd_model.pth")
+print("✅ 模型保存成功！文件：pgdm_wd_model.pth")
 
 # 保存训练配置信息
 config_info = {
